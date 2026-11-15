@@ -195,7 +195,19 @@ function logSummary(): void {
     }
   }
   const refusals = [...refusedByModel.entries()].map(([name, count]) => `${name} x${count}`).join(', ');
-  log(`summary: ${served} of ${ledger.length} prompts served in ${attempts} attempts (${refused} refusals); models: ${models.join(', ') || 'none'}${refusals === '' ? '' : `; refusals: ${refusals}`}`);
+  const servedByModel = new Map<string, number>();
+  for (const entry of ledger) {
+    if (entry === undefined || entry.modelId === null) continue;
+    servedByModel.set(entry.modelId, (servedByModel.get(entry.modelId) ?? 0) + 1);
+  }
+  const servedLine = [...servedByModel.entries()].map(([name, count]) => `${name} x${count}`).join(', ');
+  log(`summary: ${served} of ${ledger.length} prompts served in ${attempts} attempts (${refused} refusals); models: ${models.join(', ') || 'none'}${servedLine === '' ? '' : `; served: ${servedLine}`}${refusals === '' ? '' : `; refusals: ${refusals}`}`);
+  for (let i = 0; i < ledger.length; i++) {
+    const entry = ledger[i];
+    if (entry === undefined) continue;
+    const trail = entry.failures.map((f) => `${f.model ?? 'unknown'}:${f.status}`).join(', ');
+    log(`prompt ${i}: ${entry.modelId ?? 'unserved'} in ${entry.attempts} attempt(s)${trail === '' ? '' : `; refused: ${trail}`}`);
+  }
 }
 
 function log(message: string): void {
@@ -235,6 +247,23 @@ function rankedCandidates(requires: Requirement, promptIndex: number): ModelRow[
   return out;
 }
 
+/**
+ * THE FAILOVER TABLE: WHAT EACH REFUSAL MEANS AND WHAT IT COSTS
+ *
+ *   429      rate limited    the free tier's 20 req/min (or the 50/1,000-per-day ceiling) is hit:
+ *                            cool the model for the rest of the trial and try the next best.
+ *   400      bad request     the model rejects this request's shape: it stays rejected, so the
+ *                            model is done for the trial and the next candidate takes the prompt.
+ *   404      model not found the model has rotated off OpenRouter's free list (on 2026-11-16 only
+ *                            7 of the brief's 14 were still listed, the top four ratings
+ *                            included): same as a 400 — try the next candidate.
+ *   5xx      upstream error  transient: the model sits out the next prompt only, then may serve
+ *                            again if it is still the best for a later prompt's requirements.
+ *   401/403  key problem     the pushed key is missing or wrong: no model would answer, so the
+ *                            prompt ends at once instead of burning calls down the chain.
+ *   other    terminal        any status outside the table ends the prompt: the gateway, not one
+ *                            model, is refusing, and another model would meet the same refusal.
+ */
 /** Cool a model down after a refusal: a 429, 400 or 404 for the rest of the trial, a 5xx for one prompt. */
 function recordRefusal(modelId: string, status: number, promptIndex: number): void {
   if (status === 429 || status === 400 || status === 404) coolUntil.set(modelId, Number.MAX_SAFE_INTEGER);
