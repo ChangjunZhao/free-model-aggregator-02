@@ -129,6 +129,75 @@ const FAILOVER_STATUSES = new Set([400, 404, 429, 500, 502, 503, 504]);
 
 type FailureRow = { status: number; code: string; model: string | null };
 
+/**
+ * DETERMINISM AND REPLAY: WHY A REPLAY REPRODUCES THIS SERVER
+ *
+ * Every routing choice this server makes is a pure function of three things: the brief, the
+ * order the prompts arrive in, and the gateway's answers. Nothing else feeds a decision:
+ *
+ *   - the candidate order comes from the brief's rating_milli, ties broken by model id, so the
+ *     same requirements always rank the same models the same way;
+ *   - a refusal cools a model by prompt index (for the rest of the trial, or for one prompt),
+ *     never by wall-clock time, so the same refusals cool the same models on a replay;
+ *   - the prompt index itself is the brief's arrival order, counted in requirementsFor, not a
+ *     timestamp and not a counter any other request can disturb;
+ *   - the catalog is built once at startup from the brief, so the register body and
+ *     `node main.ts --list` print the same document on a live pass and on its replay;
+ *   - there is no Date.now, no Math.random, no process id and no environment-dependent branch
+ *     anywhere in the routing path: the only clock is the env's 100 ms poll, which only decides
+ *     when the process exits, never what it serves.
+ *
+ * A replay feeds the same gateway answers back from the cassette, so the same candidates are
+ * tried in the same order, the same models cool down, and the env's state export comes out byte
+ * for byte identical — which is the replay column's whole test. If a future change ever let a
+ * wall clock or an unseeded draw into a routing decision, the replay would be the first place
+ * it showed, as a state export that no longer matches.
+ *
+ * The ledger below records the same pure facts (prompt index, serving model, attempts, refusals)
+ * and is written to stderr only, never into a response, so observing the trial cannot change it.
+ */
+
+/** What one prompt cost the trial: which model served it, how many were tried, what refused first. */
+interface PromptLedger {
+  modelId: string | null;
+  attempts: number;
+  failures: FailureRow[];
+}
+/** One ledger row a prompt, keyed by the prompt's index in the brief's arrival order. */
+const ledger: PromptLedger[] = [];
+
+/** Remember how one prompt was served, for the trial summary at exit. */
+function recordLedger(modelId: string | null, failures: FailureRow[]): void {
+  ledger[currentPromptIndex] = {
+    modelId,
+    attempts: failures.length + (modelId === null ? 0 : 1),
+    failures: failures.slice(),
+  };
+  if (modelId !== null) {
+    log(`prompt ${currentPromptIndex}: served by ${modelId} after ${failures.length} refusal(s)`);
+  } else {
+    log(`prompt ${currentPromptIndex}: unserved after ${failures.length} refusal(s)`);
+  }
+}
+
+/** The trial's serving summary, written to stderr when the env says done. */
+function logSummary(): void {
+  const served = ledger.filter((entry) => entry !== undefined && entry.modelId !== null).length;
+  const attempts = ledger.reduce((sum, entry) => sum + (entry === undefined ? 0 : entry.attempts), 0);
+  const refused = ledger.reduce((sum, entry) => sum + (entry === undefined ? 0 : entry.failures.length), 0);
+  const models = [...new Set(ledger.filter((entry) => entry !== undefined && entry.modelId !== null).map((entry) => entry.modelId as string))];
+  const refusedByModel = new Map<string, number>();
+  for (const entry of ledger) {
+    if (entry === undefined) continue;
+    for (const failure of entry.failures) {
+      const name = failure.model ?? 'unknown';
+      refusedByModel.set(name, (refusedByModel.get(name) ?? 0) + 1);
+    }
+  }
+  const refusals = [...refusedByModel.entries()].map(([name, count]) => `${name} x${count}`).join(', ');
+  log(`summary: ${served} of ${ledger.length} prompts served in ${attempts} attempts (${refused} refusals); models: ${models.join(', ') || 'none'}${refusals === '' ? '' : `; refusals: ${refusals}`}`);
+}
+
 function log(message: string): void {
   process.stderr.write(`aggregator: ${message}\n`);
 }
@@ -333,6 +402,7 @@ async function chat(req: IncomingMessage, res: ServerResponse): Promise<void> {
   const body = await readJson(req);
   if (body === null) return sendError(res, 'openai', 400, 'invalid_request_error', 'the request body is not one JSON object');
   const { upstream, modelId, failures, refusedStatus, refusedText } = await attempt(body, (m) => ({ ...body, model: m }));
+  recordLedger(modelId, failures);
   if (upstream === null || modelId === null) {
     if (refusedStatus !== null) return refused(res, 'openai', refusedStatus, refusedText);
     if (refusedText !== '') return sendError(res, 'openai', 502, 'upstream_unreachable', refusedText);
@@ -357,6 +427,7 @@ async function messages(req: IncomingMessage, res: ServerResponse): Promise<void
   const body = await readJson(req);
   if (body === null) return sendError(res, 'anthropic', 400, 'invalid_request_error', 'the request body is not one JSON object');
   const { upstream, modelId, failures, refusedStatus, refusedText } = await attempt(body, (m) => anthropicToOpenAI(body, m));
+  recordLedger(modelId, failures);
   if (upstream === null || modelId === null) {
     if (refusedStatus !== null) return refused(res, 'anthropic', refusedStatus, refusedText);
     if (refusedText !== '') return sendError(res, 'anthropic', 502, 'api_error', refusedText);
@@ -426,6 +497,7 @@ function poll(server: Server): void {
         const work: unknown = await res.json();
         if (isRecord(work) && work.done === true) {
           clearInterval(timer);
+          logSummary();
           server.close();
           process.exit(0);
         }
