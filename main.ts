@@ -1,7 +1,7 @@
 // free-model-aggregator-02 entry: one server, two client wires, and a real free model behind
 // every answer. Built from the starter in the kit (same lifecycle, same routes, same catalog)
 // with its routing, failover and cooldown gaps closed: candidates ranked by the brief's
-// rating_milli, 429/5xx failover down the ranked chain with the refusals reported on
+// rating_milli, 400/404/429/5xx failover down the ranked chain with the refusals reported on
 // x-makefun-upstream-failures, and deterministic per-model cooldowns by prompt index.
 //
 // WHAT A TRIAL GIVES YOU
@@ -41,14 +41,18 @@
 // WHAT THIS ENTRY DOES DIFFERENTLY (the starter's marked gaps, closed)
 //   - quality (60%): candidates that meet the prompt's requirements are ranked by the brief's
 //     rating_milli, best first, equal ratings broken by model id; the first that answers serves.
-//   - failover (10%): a 429 or 5xx walks down the ranked chain (at most 8 tries a prompt); every
-//     refusal is reported back on x-makefun-upstream-failures, the only way the failover column
-//     can see a refusal the server retried and then served. A 401/403/400/404 is not per-model
-//     and is never retried; an unreachable gateway ends the prompt at once.
+//   - failover (10%): a 400, 404, 429 or 5xx walks down the ranked chain (at most 8 tries a prompt);
+//     every refusal is reported back on x-makefun-upstream-failures, the only way the failover column
+//     can see a refusal the server retried and then served. A 400/404 on one model means that model
+//     is gone or rejects the request shape (free models rotate off OpenRouter: on 2026-11-16 only 7 of
+//     the brief's 14 were still listed, the top four ratings included), so it is per-model and worth
+//     failing over on. A 401/403 means the pushed key is missing or wrong and no model would answer,
+//     so it is never retried; an unreachable gateway ends the prompt at once.
 //   - rate limits: refusals cool a model down deterministically, by prompt index and never by wall
-//     clock, so a replay reproduces every choice: a 429 cools it for the rest of the trial, a 5xx
-//     for the next prompt only. A cooling model is never dialled, so one rate-limited model cannot
-//     take the later prompts down with it and no call is wasted on it (the tie-break counts calls).
+//     clock, so a replay reproduces every choice: a 429, 400 or 404 cools it for the rest of the
+//     trial, a 5xx for the next prompt only. A cooling model is never dialled, so one rate-limited
+//     model cannot take the later prompts down with it and no call is wasted on it (the tie-break
+//     counts calls).
 //   - the catalog (5%): exactly the free models the brief names, registered and answered on both
 //     auth headers, no more and no fewer.
 //   The trial's rules are in the kit's RULES.txt; read them for the score's columns and the tie-break.
@@ -108,19 +112,20 @@ let currentPromptIndex = 0;
 /**
  * Per-model deterministic cooldowns, keyed by prompt index (never wall-clock time: a replay must
  * reproduce every choice from the brief, the requests and the gateway's answers alone).
- * coolUntil[model] = the prompt index before which the model is skipped; a 429 cools it for the
- * rest of the trial (a free-tier rate limit does not clear inside one six-prompt trial), a 5xx
- * cools it for the next prompt only (a transient upstream failure may clear).
+ * coolUntil[model] = the prompt index before which the model is skipped; a 429, 400 or 404 cools
+ * it for the rest of the trial (a free-tier rate limit does not clear inside one six-prompt trial,
+ * and a model that is gone or rejects the shape stays gone), a 5xx cools it for the next prompt
+ * only (a transient upstream failure may clear).
  */
 const coolUntil = new Map<string, number>();
 /** The most models tried for one prompt: enough to walk down the rating order, few enough that a dead gateway cannot burn the tie-break (fewer gateway calls win an exact score tie). */
 const MAX_ATTEMPTS_PER_PROMPT = 8;
 /**
  * Refusal statuses worth failing over on: a rate limit or an upstream failure may clear on another
- * model. A 401/403 means the pushed key is missing or wrong and no model would answer; a 400/404
- * means the request itself is wrong. Neither is per-model, so neither is retried.
+ * model, and a 400/404 names one model that is gone or rejects the request shape. A 401/403 means
+ * the pushed key is missing or wrong and no model would answer, so it is never retried.
  */
-const FAILOVER_STATUSES = new Set([429, 500, 502, 503, 504]);
+const FAILOVER_STATUSES = new Set([400, 404, 429, 500, 502, 503, 504]);
 
 type FailureRow = { status: number; code: string; model: string | null };
 
@@ -161,9 +166,9 @@ function rankedCandidates(requires: Requirement, promptIndex: number): ModelRow[
   return out;
 }
 
-/** Cool a model down after a refusal: a 429 for the rest of the trial, a 5xx for one prompt. */
+/** Cool a model down after a refusal: a 429, 400 or 404 for the rest of the trial, a 5xx for one prompt. */
 function recordRefusal(modelId: string, status: number, promptIndex: number): void {
-  if (status === 429) coolUntil.set(modelId, Number.MAX_SAFE_INTEGER);
+  if (status === 429 || status === 400 || status === 404) coolUntil.set(modelId, Number.MAX_SAFE_INTEGER);
   else coolUntil.set(modelId, Math.max(coolUntil.get(modelId) ?? -1, promptIndex + 2));
 }
 
